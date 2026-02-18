@@ -1,11 +1,8 @@
 import streamlit as st
 import os
 import time
+import tempfile
 from pathlib import Path
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # LangChain imports
 from langchain_groq import ChatGroq
@@ -13,7 +10,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -50,6 +47,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     border: 1px solid #bbf7d0;
     color: #166534;
     font-size: 0.9rem;
+    margin-bottom: 0.5rem;
 }
 .status-info {
     padding: 0.6rem 1rem;
@@ -58,6 +56,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     border: 1px solid #bfdbfe;
     color: #1e40af;
     font-size: 0.9rem;
+    margin-bottom: 0.5rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -65,25 +64,14 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 
 # ─── Session State ───────────────────────────────────────────────────────────
 def init_session_state():
-    defaults = {"vectors": None, "embeddings": None, "docs_loaded": False}
+    defaults = {
+        "vectors": None,
+        "embeddings": None,
+        "docs_loaded": False,
+        "groq_api_key": "",
+    }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
-
-
-# ─── Environment Validation ──────────────────────────────────────────────────
-def validate_environment():
-    errors = []
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if not groq_api_key:
-        errors.append("GROQ_API_KEY is missing from environment variables.")
-
-    papers_dir = Path("research_papers")
-    if not papers_dir.exists():
-        errors.append("Directory 'research_papers/' not found. Create it and add PDF files.")
-    elif not list(papers_dir.glob("*.pdf")):
-        errors.append("No PDF files found in 'research_papers/'. Add at least one PDF.")
-
-    return errors, groq_api_key
 
 
 # ─── Cached Resources ────────────────────────────────────────────────────────
@@ -101,33 +89,45 @@ def initialize_embeddings():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
-# ─── Vector Store Creation ───────────────────────────────────────────────────
-def create_vector_embedding():
+# ─── Vector Store Creation from Uploaded Files ───────────────────────────────
+def create_vector_embedding(uploaded_files):
     try:
+        all_docs = []
+
         with st.spinner("Loading embeddings model…"):
-            st.session_state.embeddings = initialize_embeddings()
+            embeddings = initialize_embeddings()
+            st.session_state.embeddings = embeddings
 
-        with st.spinner("Loading PDF documents…"):
-            loader = PyPDFDirectoryLoader("research_papers")
-            docs = loader.load()
-            if not docs:
-                st.error("No documents loaded. Check your PDF files.")
+        with st.spinner("Reading uploaded PDFs…"):
+            for uploaded_file in uploaded_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_file.read())
+                    tmp_path = tmp.name
+
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+                all_docs.extend(docs)
+                os.unlink(tmp_path)
+
+            if not all_docs:
+                st.error("No content extracted from PDFs. Check your files.")
                 return False
-            st.info(f"Loaded {len(docs)} page(s) from PDFs.")
 
-        with st.spinner("Splitting documents into chunks…"):
+            st.info(f"Loaded {len(all_docs)} page(s) from {len(uploaded_files)} file(s).")
+
+        with st.spinner("Splitting into chunks…"):
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            chunks = splitter.split_documents(docs[:50])
+            chunks = splitter.split_documents(all_docs)
             st.info(f"Created {len(chunks)} text chunks.")
 
-        with st.spinner("Building vector index (may take a moment)…"):
-            st.session_state.vectors = FAISS.from_documents(chunks, st.session_state.embeddings)
+        with st.spinner("Building vector index…"):
+            st.session_state.vectors = FAISS.from_documents(chunks, embeddings)
             st.session_state.docs_loaded = True
 
         return True
 
     except Exception as e:
-        st.error(f"Error creating vector embeddings: {e}")
+        st.error(f"Error processing documents: {e}")
         st.session_state.docs_loaded = False
         return False
 
@@ -136,52 +136,76 @@ def create_vector_embedding():
 def main():
     init_session_state()
 
-    # Header
     st.markdown('<h1 class="main-header">📚 RAG Document Q&A</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Powered by Groq · Llama 3.1 · FAISS</p>', unsafe_allow_html=True)
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("⚙️ Setup")
-        errors, groq_api_key = validate_environment()
+        st.header("⚙️ Configuration")
 
-        if errors:
-            st.error("**Configuration issues found:**")
-            for err in errors:
-                st.write(f"❌ {err}")
-            st.markdown("""
-**Quick Setup:**
-1. Create a `.env` file:
-```
-GROQ_API_KEY=your_key_here
-HF_TOKEN=your_hf_token
-```
-2. Create `research_papers/` folder
-3. Add PDF files to the folder
-4. Restart the app
-""")
-            return
+        # ── Step 1: API Key ──
+        st.subheader("Step 1 · API Key")
+        groq_api_key = st.text_input(
+            "Groq API Key",
+            type="password",
+            placeholder="gsk_...",
+            value=st.session_state.groq_api_key,
+            help="Get your free key at https://console.groq.com",
+        )
 
-        st.markdown('<div class="status-ok">✅ Environment configured</div>', unsafe_allow_html=True)
+        if groq_api_key:
+            st.session_state.groq_api_key = groq_api_key
+            st.markdown('<div class="status-ok">✅ API key entered</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-info">🔑 Enter your Groq API key above</div>', unsafe_allow_html=True)
+            st.markdown("Get a free key at [console.groq.com](https://console.groq.com)")
+
         st.markdown("---")
-        st.subheader("📄 Document Processing")
 
-        if st.button("🔄 Load & Process Documents", use_container_width=True):
-            success = create_vector_embedding()
-            if success:
-                st.success("✅ Vector database ready!")
+        # ── Step 2: Upload PDFs ──
+        st.subheader("Step 2 · Upload PDFs")
+        uploaded_files = st.file_uploader(
+            "Upload one or more PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Your PDFs are processed in-memory and never stored permanently.",
+        )
+
+        if uploaded_files:
+            st.markdown(f'<div class="status-ok">✅ {len(uploaded_files)} file(s) ready</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-info">📄 Upload PDF files above</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Step 3: Process ──
+        st.subheader("Step 3 · Process Documents")
+
+        process_disabled = not groq_api_key or not uploaded_files
+        if st.button("🔄 Build Vector Index", use_container_width=True, disabled=process_disabled):
+            if create_vector_embedding(uploaded_files):
+                st.success("✅ Index built! You can now ask questions.")
             else:
-                st.error("❌ Processing failed. See errors above.")
+                st.error("❌ Processing failed.")
+
+        if process_disabled:
+            st.caption("Complete Steps 1 & 2 to enable processing.")
 
         if st.session_state.docs_loaded:
-            st.markdown('<div class="status-ok">✅ Documents loaded & indexed</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="status-info">ℹ️ Click above to load documents</div>', unsafe_allow_html=True)
+            st.markdown('<div class="status-ok">✅ Documents indexed & ready</div>', unsafe_allow_html=True)
 
         st.markdown("---")
         st.caption("Stack: Groq · Llama 3.1 · FAISS · HuggingFace · LangChain · Streamlit")
 
-    # ── Query Interface ───────────────────────────────────────────────────────
+    # ── Main: Query Interface ─────────────────────────────────────────────────
+    if not st.session_state.groq_api_key:
+        st.info("👈 Enter your Groq API key in the sidebar to get started.")
+        return
+
+    if not st.session_state.docs_loaded:
+        st.info("👈 Upload PDFs and click **Build Vector Index** in the sidebar.")
+        return
+
     col1, col2 = st.columns([4, 1])
     with col1:
         user_prompt = st.text_input(
@@ -193,16 +217,9 @@ HF_TOKEN=your_hf_token
         st.write("")
         search = st.button("🔍 Search", use_container_width=True)
 
-    if search or user_prompt:
-        if not st.session_state.docs_loaded:
-            st.warning("⚠️ Please load and process documents first (sidebar).")
-            return
-        if not user_prompt:
-            st.warning("⚠️ Please enter a query.")
-            return
-
+    if search and user_prompt:
         try:
-            llm = initialize_llm(groq_api_key)
+            llm = initialize_llm(st.session_state.groq_api_key)
 
             prompt_template = ChatPromptTemplate.from_template(
                 """Answer the question based only on the provided context.
@@ -234,12 +251,18 @@ Answer:"""
                     st.markdown(f"**Chunk {i + 1}**")
                     st.text(doc.page_content)
                     if doc.metadata:
-                        st.caption(f"Source: {doc.metadata.get('source', 'Unknown')} | Page: {doc.metadata.get('page', '?')}")
+                        st.caption(
+                            f"Source: {doc.metadata.get('source', 'Uploaded file')} "
+                            f"| Page: {doc.metadata.get('page', '?')}"
+                        )
                     st.markdown("---")
 
         except Exception as e:
             st.error(f"❌ Query failed: {e}")
             st.exception(e)
+
+    elif search and not user_prompt:
+        st.warning("⚠️ Please enter a question.")
 
 
 if __name__ == "__main__":
